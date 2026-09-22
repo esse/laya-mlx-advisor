@@ -40,6 +40,26 @@ key or Claude subscription login; no credentials are copied or stored by this
 project. Direct Anthropic service is supported; Bedrock, Vertex, Foundry, and
 existing third-party gateways are not integrated.
 
+### Use your usual `claude` and `codex` commands
+
+Add these functions to your shell startup file (`~/.zshrc` for Zsh or
+`~/.bashrc` for Bash), replacing the example path with this checkout's absolute
+path:
+
+```sh
+claude() { "/absolute/path/to/Laya-MLX-Advisor/bin/claude-laya" -- "$@"; }
+codex()  { "/absolute/path/to/Laya-MLX-Advisor/bin/codex-laya" -- "$@"; }
+```
+
+Reload that file or open a new terminal, then use `claude` and `codex` with your
+usual arguments. The functions start or reuse the same daemon and configure
+routing automatically. For Codex API-key authentication, add `--auth api` before
+the function's `--` separator.
+
+This applies to sessions launched through these shell functions; restart any
+already-running agent sessions. Installing the plugin alone does not activate
+routing. Use `command claude` or `command codex` to bypass the functions.
+
 ## Plugin installation
 
 The repository contains both native plugin manifests in
