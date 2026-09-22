@@ -1,0 +1,17 @@
+{
+  "name": "laya-mlx-advisor-local",
+  "owner": {
+    "name": "Laya-MLX-Advisor contributors"
+  },
+  "plugins": [
+    {
+      "name": "laya-mlx-advisor",
+      "source": "./plugins/laya-mlx-advisor",
+      "description": "Local adaptive reasoning for Claude Code and Codex CLI",
+      "version": "0.1.0"
+    }
+  ],
+  "metadata": {
+    "description": "One local Laya-MLX-Advisor daemon for Claude Code and Codex CLI."
+  }
+}

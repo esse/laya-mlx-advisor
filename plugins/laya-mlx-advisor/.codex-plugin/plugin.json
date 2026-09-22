@@ -1,0 +1,18 @@
+{
+  "name": "laya-mlx-advisor",
+  "version": "0.1.0",
+  "description": "Adaptive reasoning for Codex CLI and Claude Code through one local Laya daemon.",
+  "author": {
+    "name": "Laya-MLX-Advisor contributors"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Laya-MLX-Advisor",
+    "shortDescription": "Route reasoning with one local Laya model.",
+    "longDescription": "Inspect and use the shared repository-local Laya daemon for Codex CLI and Claude Code. Launch routed sessions with the companion CLI launchers.",
+    "developerName": "Laya-MLX-Advisor contributors",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Inspect the shared Laya daemon and its routing decisions."
+  }
+}

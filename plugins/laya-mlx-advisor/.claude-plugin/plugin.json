@@ -1,0 +1,7 @@
+{
+  "name": "laya-mlx-advisor",
+  "version": "0.1.0",
+  "description": "Use the repository-local Laya daemon to route Claude Code and Codex reasoning effort.",
+  "author": {"name": "Laya-MLX-Advisor contributors"},
+  "skills": "./skills/"
+}

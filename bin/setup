@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export UV_CACHE_DIR="$root/.cache/uv"
+export UV_PYTHON_INSTALL_DIR="$root/.cache/python"
+export HF_HOME="$root/.cache/huggingface"
+uv sync --project "$root"
+printf '\nReady: %s/bin/codex-laya or %s/bin/claude-laya\n' "$root" "$root"
