@@ -26,8 +26,11 @@ QUESTION = {"effort": {
     "type": "choice",
     "instructions": "Classify the reasoning needed for the NEXT coding step using the current evidence.",
     "criteria": {
-        "routine": "Straightforward known edit, read a file, run a command, or report a confirmed result.",
-        "difficult": "Diagnose unexplained failures, resolve conflicting evidence, design an algorithm, or reason about complex interactions.",
+        "low": "Mechanical edit, known command, file lookup, or reporting a confirmed result.",
+        "medium": "Routine implementation with a clear approach and a few local decisions.",
+        "high": "Nontrivial debugging or implementation requiring several connected reasoning steps.",
+        "xhigh": "Subtle failures, conflicting evidence, or complex architectural and concurrency interactions.",
+        "max": "Exceptionally difficult novel algorithms, research problems, or rigorous correctness proofs.",
     },
 }}
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -124,6 +127,8 @@ class Router:
         model = body.get("model", "")
         if protocol == "claude":
             levels = list(LEVELS) if CLAUDE_MAX.fullmatch(model) else []
+            if re.fullmatch(r"claude-(?:opus-4-6|sonnet-4-6|mythos-preview)(?:-\d{8})?", model):
+                levels = [level for level in levels if level != "xhigh"]
             if re.fullmatch(r"claude-opus-4-5(?:-\d{8})?", model):
                 levels = ["low", "medium", "high"]
             if body.get("thinking", {}).get("type") == "disabled":
@@ -155,12 +160,13 @@ class Router:
                 future = self.pending
             answer = future.result(timeout=self.timeout)["answers"]["effort"]
             confidence = float(answer["probabilities"][answer["choice"]])
-            if answer["choice"] not in ("routine", "difficult") or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            if answer["choice"] not in LEVELS or not math.isfinite(confidence) or not 0 <= confidence <= 1:
                 raise ValueError("invalid prediction")
             if confidence < (self.threshold if threshold is None else threshold):
                 note(f"unchanged: confidence={confidence:.2f}")
                 return body
-            effort = "low" if answer["choice"] == "routine" else available[-1]
+            effort = next((level for level in available
+                           if LEVELS.index(level) >= LEVELS.index(answer["choice"])), available[-1])
             result = copy.deepcopy(body)
             key = "output_config" if protocol == "claude" else "reasoning"
             result[key] = {**(result.get(key) or {}), "effort": effort}

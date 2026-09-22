@@ -18,7 +18,7 @@ from scripts.laya_mlx_advisor import Router, Proxy, context_for, launch_args, cl
 
 
 class Classifier:
-    def __init__(self, choice="routine", confidence=0.99):
+    def __init__(self, choice="low", confidence=0.99):
         self.choice, self.confidence = choice, confidence
         self.states = []
 
@@ -40,6 +40,38 @@ def request():
 
 
 class RoutingTests(unittest.TestCase):
+    def test_selects_every_effort_for_both_harnesses(self):
+        levels = ["low", "medium", "high", "xhigh", "max"]
+        for protocol in ("codex", "claude"):
+            classifier = Classifier()
+            router = Router(classifier, {"test-model": levels})
+            body = request() if protocol == "codex" else {
+                "model": "claude-opus-4-8", "messages": [{"role": "user", "content": "Implement this task"}],
+                "thinking": {"type": "adaptive"}, "output_config": {"effort": "high"}}
+            key = "reasoning" if protocol == "codex" else "output_config"
+            try:
+                for level in levels:
+                    with self.subTest(protocol=protocol, level=level):
+                        classifier.choice = level
+                        body[key]["effort"] = "high" if level != "high" else "low"
+                        self.assertEqual(router.rewrite(body, protocol)[key]["effort"], level)
+            finally:
+                router.close()
+
+    def test_missing_intermediate_level_rounds_up_without_exceeding_capabilities(self):
+        classifier = Classifier("xhigh")
+        router = Router(classifier, {"test-model": ["low", "medium", "high", "max"]})
+        try:
+            self.assertEqual(router.rewrite(request())["reasoning"]["effort"], "max")
+            for model in ("claude-sonnet-4-6", "claude-opus-4-6", "claude-mythos-preview"):
+                body = {"model": model, "messages": [{"role": "user", "content": "Investigate this task"}]}
+                self.assertEqual(router.rewrite(body, "claude")["output_config"]["effort"], "max")
+            classifier.choice = "medium"
+            router.models = {"test-model": ["low", "high"]}
+            self.assertEqual(router.rewrite(request())["reasoning"]["effort"], "high")
+        finally:
+            router.close()
+
     def test_real_catalog_filters_ultra_before_sending_capabilities(self):
         with tempfile.TemporaryDirectory() as folder:
             Path(folder, "models_cache.json").write_text(json.dumps({"models": [
@@ -61,7 +93,7 @@ class RoutingTests(unittest.TestCase):
             {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "id": "t1", "input": {"command": "test"}}]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "Unexplained race condition"}]},
         ])
-        classifier.choice = "difficult"
+        classifier.choice = "max"
         changed = router.rewrite(body, "claude")
         self.assertEqual(changed["output_config"]["effort"], "max")
         changed["output_config"]["effort"] = "high"
@@ -89,7 +121,7 @@ class RoutingTests(unittest.TestCase):
         original = copy.deepcopy(body)
         self.assertEqual(router.rewrite(body)["reasoning"]["effort"], "low")
         self.assertEqual(body, original)
-        classifier.choice = "difficult"
+        classifier.choice = "max"
         body["input"].append({"type": "function_call_output", "call_id": "1",
                               "output": "Unexpected race; the same test fails intermittently"})
         result = router.rewrite(body)
@@ -113,7 +145,7 @@ class RoutingTests(unittest.TestCase):
     def test_caps_at_supported_effort_without_selecting_ultra(self):
         for levels, expected in [(["low", "high", "xhigh"], "xhigh"),
                                  (["low", "high", "max", "ultra"], "max")]:
-            router = Router(Classifier("difficult"), {"test-model": levels})
+            router = Router(Classifier("max"), {"test-model": levels})
             self.assertEqual(router.rewrite(request())["reasoning"]["effort"], expected)
 
     def test_context_prioritizes_latest_tool_result_and_omits_hidden_reasoning(self):
@@ -307,7 +339,7 @@ class RoutingTests(unittest.TestCase):
         """No cloud calls: both installed CLIs share one fake-upstream proxy."""
         received = []
         claude_received = []
-        classifier = Classifier("difficult")
+        classifier = Classifier("max")
 
         class Upstream(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -320,7 +352,7 @@ class RoutingTests(unittest.TestCase):
                     item = {"type": "custom_tool_call", "id": "fc_1", "call_id": "call_1",
                             "name": "exec", "namespace": "functions",
                             "input": "text(await tools.exec_command({cmd: \"printf 'confirmed result'\"}));"}
-                    classifier.choice = "routine"
+                    classifier.choice = "low"
                 else:
                     item = {"type": "message", "id": "msg_1", "role": "assistant",
                             "content": [{"type": "output_text", "text": "Verified routing.", "annotations": []}]}
@@ -353,7 +385,7 @@ class RoutingTests(unittest.TestCase):
                     {"type": "message_delta", "delta": {"stop_reason": "tool_use" if n == 1 else "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 10}},
                     {"type": "message_stop"},
                 ]
-                classifier.choice = "routine"
+                classifier.choice = "low"
                 payload = "".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -386,7 +418,7 @@ class RoutingTests(unittest.TestCase):
                 self.assertIn("confirmed result", classifier.states[-1])
                 outputs = [i.get("output", "") for i in received[-1]["input"] if i.get("type") in ("function_call_output", "custom_tool_call_output")]
                 self.assertTrue(any("confirmed result" in str(o) and ("exit_code\":0" in str(o) or "exit_code\": 0" in str(o) or "exit code: 0" in str(o).lower()) for o in outputs), outputs)
-                classifier.choice = "difficult"
+                classifier.choice = "max"
                 env = claude_env(f"http://127.0.0.1:{proxy.server_port}/anthropic", "secret", {
                     **os.environ, "CLAUDE_CONFIG_DIR": home, "ANTHROPIC_API_KEY": "local-test-not-a-real-key",
                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"})

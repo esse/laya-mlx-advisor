@@ -3,8 +3,8 @@
 Adaptive reasoning effort for **local Codex CLI and local Claude Code**, using one
 resident [laya-mlx](https://github.com/mizorewww/laya-mlx) model on Apple Silicon.
 Both harnesses send their model requests through the same local daemon. It
-classifies the next step and selects `low` for routine work or the model's
-supported maximum (up to `max`) for difficult work, including after tool results.
+classifies each next step, including after tool results, and selects `low`,
+`medium`, `high`, `xhigh`, or `max` according to its difficulty.
 
 ## Run
 
@@ -104,6 +104,13 @@ separate entropy-derived `confidence` field is deliberately not used. Tune it pe
 launcher, for example `./bin/claude-laya --threshold 0.85`. Below the threshold,
 on an error, while inference is busy, or after a two-second deadline, the original
 request is forwarded unchanged. Routing decisions appear in the daemon log.
+
+The five choices describe mechanical work (`low`), routine implementation
+(`medium`), multistep debugging (`high`), complex interactions (`xhigh`), and
+exceptionally difficult research or proofs (`max`). If a model lacks the selected
+level, routing uses the next higher supported level, capped at its maximum.
+The threshold still applies to the winning choice; with five choices it may
+preserve the original effort more often than the former two-choice classifier.
 
 Codex capabilities come from its existing `models_cache.json`. Unknown models
 pass through. To supply known capabilities explicitly:
