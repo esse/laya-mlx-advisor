@@ -265,19 +265,18 @@ class Router:
                     state["decided"] != decided):
                 self.states.move_to_end(key)
                 return list(state["records"]), False
-            inserted = False
+            committed = False
             anchor = self._record_anchor(protocol, items, index)
             if (state["decided"] != (index, anchor) and
                     not any(record[0] == index for record in state["records"])):
                 if effort is not None and len(state["records"]) < RECORD_LIMIT:
-                    state["records"] = [record for record in state["records"] if record[0] < index]
                     state["records"].append((index, anchor, effort))
                     state["records"].sort(key=lambda record: record[0])
-                    inserted = True
                 state["decided"] = (index, anchor)
                 state["version"] += 1
+                committed = True
             self.states.move_to_end(key)
-            return list(state["records"]), inserted
+            return list(state["records"]), committed
 
     def _visible_records(self, protocol, items, records):
         limit = len(items) if protocol == "claude" else len(items) - 1
@@ -305,10 +304,10 @@ class Router:
         return result
 
     def _finish(self, body, protocol, key, items, index, version, records, decided, effort,
-                log=None, unchanged=False):
-        final_records, inserted = self._commit(key, protocol, items, index, version, records, decided, effort)
+                log=None):
+        final_records, committed = self._commit(key, protocol, items, index, version, records, decided, effort)
         result = self._with_records(body, protocol, final_records)
-        if log and (inserted or unchanged):
+        if log and committed:
             note(log)
         else:
             replayed = len(self._visible_records(protocol, items, final_records))
@@ -376,6 +375,13 @@ class Router:
             if records:
                 note(f"harness={protocol} replayed={len(records)}")
             return result
+        frontier = max(records[-1][0] if records else -1,
+                       decided[0] if decided is not None else -1)
+        if insertion < frontier:
+            result = self._with_records(body, protocol, records)
+            if records:
+                note(f"harness={protocol} replayed={len(records)}")
+            return result
         if len(records) >= RECORD_LIMIT:
             return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
         state = claude_context(body) if protocol == "claude" else context_for(body)
@@ -419,7 +425,7 @@ class Router:
                            if LEVELS.index(level) >= LEVELS.index(answer["choice"])), available[-1])
             if effort == effective:
                 result = self._finish(body, protocol, key, items, insertion, version, records, decided, None,
-                                      f"harness={protocol} effort={effort} unchanged replayed={replayed}", True)
+                                      f"harness={protocol} effort={effort} unchanged replayed={replayed}")
                 return result
             return self._finish(body, protocol, key, items, insertion, version, records, decided,
                                 effort,

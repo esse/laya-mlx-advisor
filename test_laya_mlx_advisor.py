@@ -177,6 +177,31 @@ class RoutingTests(unittest.TestCase):
         finally:
             router.close()
 
+    def test_claude_replays_prefix_with_trailing_harness_effort_message(self):
+        classifier = Classifier("max")
+        router = Router(classifier, {})
+        first_body = {"model": "claude-opus-5-5", "thinking": {"type": "adaptive"},
+                      "output_config": {"effort": "low"},
+                      "messages": [{"role": "user", "content": "Start"},
+                                   {"role": "system", "content": "Hook output",
+                                    "output_config": {"effort": "medium"}}]}
+        try:
+            first = route(router, first_body, "claude", conversation_id="claude-prefix")
+            continuation = copy.deepcopy(first_body)
+            continuation["messages"].extend([
+                {"role": "assistant", "content": [{"type": "text", "text": "Done"}]},
+                {"role": "user", "content": "Continue"},
+            ])
+            classifier.choice = "low"
+            second = route(router, continuation, "claude", conversation_id="claude-prefix")
+            self.assertEqual(
+                [json.dumps(message, ensure_ascii=False) for message in second["messages"][:len(first["messages"])]],
+                [json.dumps(message, ensure_ascii=False) for message in first["messages"]])
+            self.assertEqual(second["messages"][-1],
+                             {"role": "system", "content": [], "output_config": {"effort": "low"}})
+        finally:
+            router.close()
+
     def test_fallback_and_equal_effort_are_decided_once_but_replay_old_updates(self):
         classifier = Classifier("max")
         router = Router(classifier, {"gpt-6-astra": ["low", "max"]})
@@ -206,7 +231,7 @@ class RoutingTests(unittest.TestCase):
         finally:
             router.close()
 
-    def test_history_edit_drops_stale_decision_before_later_record(self):
+    def test_history_edit_resets_record_at_existing_position(self):
         classifier = Classifier("low")
         router = Router(classifier, {"gpt-6-astra": ["low", "max"]})
         body = request()
@@ -225,8 +250,7 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(third)], ["low", "max"])
 
             edited = copy.deepcopy(body)
-            edited["input"][2]["content"] = "Edited second turn"
-            edited["input"] = edited["input"][:3]
+            edited["input"][4]["content"] = "Edited third turn"
             calls = len(classifier.states)
             rerouted = route(router, edited)
             self.assertEqual(len(classifier.states), calls + 1)
@@ -234,7 +258,7 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(len(classifier.states), calls + 1)
             self.assertEqual(route(router, edited), rerouted)
             self.assertEqual(len(classifier.states), calls + 1)
-            self.assertEqual(next(iter(router.states.values()))["decided"][0], 2)
+            self.assertEqual(next(iter(router.states.values()))["decided"][0], 4)
         finally:
             router.close()
 
@@ -350,9 +374,10 @@ class RoutingTests(unittest.TestCase):
         try:
             self.assertTrue(ready.wait(1))
             longer_result = route(router, longer, conversation_id="overlap")
-            calls = len(classifier.states)
             release.set()
             thread.join(2)
+            calls = len(classifier.states)
+            self.assertEqual(route(router, shorter, conversation_id="overlap"), shorter)
             self.assertEqual(route(router, longer, conversation_id="overlap"), longer_result)
             self.assertEqual(len(classifier.states), calls)
             self.assertEqual(len(next(iter(router.states.values()))["records"]), 1)
@@ -925,7 +950,7 @@ class RoutingTests(unittest.TestCase):
                            "-m", "gpt-6-astra", "-s", "read-only", "-a", "never",
                            "exec", "--skip-git-repo-check", "--ephemeral", "-C", home,
                            "Run printf to verify the result, then report it."]
-                result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Verified routing.", result.stdout)
                 original_effort = received[0]["reasoning"]["effort"]

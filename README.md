@@ -152,8 +152,8 @@ harness-authored top-level effort unchanged. Codex updates precede new
 user/developer or tool-result items; Claude updates are appended after Claude
 Code's own trailing effort messages, and the router overrides those per-message
 efforts. Updates are replayed at their original positions on later requests.
-Unsupported models, media, provider
-compaction modes, and Codex's existing per-message overrides pass through untouched.
+Unsupported models, media, provider compaction modes, and Codex's existing
+per-message overrides pass through untouched.
 
 Routing state is bounded in memory, so a daemon restart, LRU eviction, or
 history rewrite may cause cache misses. A classifier timeout, error, or low
