@@ -26,7 +26,7 @@ Pass harness arguments after `--`:
 
 ```sh
 ./bin/codex-laya --target-model gpt-6-astra -- exec 'Investigate the failing tests'
-./bin/claude-laya --target-model claude-opus-4-8 -- -p 'Investigate the failing tests'
+./bin/claude-laya --target-model claude-opus-5-5 -- -p 'Investigate the failing tests'
 
 # Codex with an API key instead of its existing ChatGPT login:
 ./bin/codex-laya --auth api -- --model gpt-6-astra
@@ -139,20 +139,34 @@ pass through. To supply known capabilities explicitly:
 ./bin/codex-laya --target-model gpt-6-astra --efforts low,medium,high,xhigh,max
 ```
 
-Claude uses a conservative allowlist of documented effort-capable models. Unknown
-models pass through; requests with thinking explicitly disabled are capped at
-`high`. Neither harness is upgraded to `ultra`. Media-containing histories and
-explicit per-message effort updates pass through unchanged. Token-counting and
-compaction endpoints are forwarded without classification.
+Neither harness is upgraded to `ultra`. Token-counting and compaction endpoints
+are forwarded without classification.
 
-Changing the top-level effort may reduce prompt-cache reuse. We do not inject
-per-message configuration updates because their model and compaction restrictions
-differ. Codex uses HTTP streaming instead of WebSockets so every model request
-passes through routing. HTTP errors and streamed response bytes are relayed;
+Cache-safe routing is enabled only for Claude `claude-fable-5-1`,
+`claude-mythos-5-1`, `claude-opus-5-5`, and `claude-opus-5`, plus Codex
+`gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` when their catalog or explicit
+capabilities list includes `low`. For these models, the proxy keeps the
+harness-authored top-level effort unchanged and inserts per-message effort
+updates before new user/tool-result items, then replays those updates at their
+original positions on later requests. Unsupported models, media, provider
+compaction modes, and existing per-message overrides pass through untouched.
+
+Routing state is bounded in memory, so a daemon restart, LRU eviction, or
+history rewrite may cause cache misses. A classifier timeout, error, or low
+confidence replays existing updates without creating a new one. Claude's
+`count_tokens` endpoint is forwarded without rewriting and may slightly
+undercount the injected items. This follows Anthropic's
+[per-message effort](https://platform.claude.com/docs/en/build-with-claude/effort)
+and OpenAI's
+[mid-conversation reasoning updates](https://developers.openai.com/api/docs/guides/reasoning?api-mode=responses#change-reasoning-mid-conversation)
+requirements.
+
+Codex uses HTTP streaming instead of WebSockets so every model request passes
+through routing. HTTP errors and streamed response bytes are relayed;
 credentials stay in memory and are forwarded only to fixed provider endpoints.
 
 The request formats and launch controls were checked against Codex CLI **0.153.2**
-and Claude Code **2.1.278**. Claude subscription routing uses the installed CLI's
+and Claude Code **2.1.281**. Claude subscription routing uses the installed CLI's
 `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` compatibility flag. Fake-upstream tests
 exercise both real CLIs, not subscription billing or live provider acceptance.
 
