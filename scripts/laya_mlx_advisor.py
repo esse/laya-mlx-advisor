@@ -3,13 +3,14 @@
 import argparse
 import concurrent.futures
 import copy
+from collections import OrderedDict
+import hashlib
 import hmac
 import http.client
 import json
 import math
 import os
 from pathlib import Path
-import re
 import signal
 import subprocess
 import sys
@@ -20,8 +21,11 @@ from urllib.parse import urlsplit
 
 LEVELS = ("low", "medium", "high", "xhigh", "max")
 ROOT = Path(__file__).resolve().parents[1]
-# Anthropic's documented effort-capable models; unknown models pass through.
-CLAUDE_MAX = re.compile(r"^claude-(?:(?:opus-(?:4-[678]|5)|sonnet-(?:4-6|5)|(?:fable|mythos)-5(?:-1)?|mythos-preview))(?:-\d{8})?$")
+CLAUDE_MODELS = {"claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5", "claude-opus-5"}
+CODEX_MODELS = {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"}
+CLAUDE_BETA = "mid-conversation-output-config-2026-07-01"
+STATE_LIMIT = 128
+RECORD_LIMIT = 64
 QUESTION = {"effort": {
     "type": "choice",
     "instructions": "Classify the reasoning needed for the NEXT coding step using the current evidence.",
@@ -114,6 +118,61 @@ def has_media(value):
     return isinstance(value, list) and any(has_media(v) for v in value)
 
 
+def normalized_item(value):
+    if isinstance(value, dict):
+        kind = value.get("type")
+        if kind == "tool_result":
+            return {"type": kind, "tool_use_id": value.get("tool_use_id")}
+        if kind in ("function_call_output", "custom_tool_call_output"):
+            return {"type": kind, "call_id": value.get("call_id")}
+        return {key: normalized_item(item) for key, item in value.items() if key != "cache_control"}
+    if isinstance(value, list):
+        return [normalized_item(item) for item in value]
+    return value
+
+
+def item_hash(item):
+    return hashlib.sha256(json.dumps(normalized_item(item), sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def append_claude_beta(headers):
+    values, seen = [], set()
+    for key in list(headers):
+        if key.lower() != "anthropic-beta":
+            continue
+        for value in headers.pop(key).split(","):
+            value = value.strip()
+            if value and value.lower() not in seen:
+                values.append(value)
+                seen.add(value.lower())
+    if CLAUDE_BETA.lower() not in seen:
+        values.append(CLAUDE_BETA)
+    headers["anthropic-beta"] = ",".join(values)
+
+
+def claude_boundary(items):
+    if not items or items[-1].get("role") != "user":
+        return None
+    content = items[-1].get("content")
+    if isinstance(content, str):
+        return len(items) - 1 if content else None
+    if isinstance(content, list) and any(isinstance(block, dict) and
+            block.get("type") in ("text", "tool_result") for block in content):
+        return len(items) - 1
+    return None
+
+
+def codex_boundary(items):
+    def is_new(item):
+        return item.get("role") in ("user", "developer") or item.get("type") in (
+            "function_call_output", "custom_tool_call_output")
+    index = len(items)
+    while index and is_new(items[index - 1]):
+        index -= 1
+    return index if index < len(items) else None
+
+
 class Router:
     def __init__(self, agent, models, threshold=0.7, timeout=2.0):
         self.agent, self.models = agent, models
@@ -121,41 +180,185 @@ class Router:
         # ponytail: one inference worker serializes MLX; busy requests retain their original effort.
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.states = OrderedDict()
         self.pending = None
 
-    def rewrite(self, body, protocol="codex", threshold=None, capabilities=None):
+    def _conversation_id(self, body, protocol, conversation_id):
+        if protocol == "claude":
+            metadata = body.get("metadata")
+            user_id = metadata.get("user_id") if isinstance(metadata, dict) else None
+            if isinstance(user_id, str):
+                try:
+                    user_id = json.loads(user_id)
+                except (TypeError, ValueError):
+                    user_id = None
+            if isinstance(user_id, dict) and user_id.get("session_id"):
+                return user_id["session_id"]
+        return conversation_id if isinstance(conversation_id, str) and conversation_id else None
+
+    def _state_key(self, protocol, model, conversation_id, items):
+        value = json.dumps([protocol, model, conversation_id, item_hash(items[0])],
+                           separators=(",", ":"))
+        # ponytail: first-item hashing separates normal branches; identical first items can still collide.
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def _normalize_state(self, state, items):
+        records = state["records"]
+        valid = []
+        invalid_at = None
+        for record in records:
+            index, anchor, _ = record
+            if index >= len(items) or item_hash(items[index]) != anchor:
+                invalid_at = index
+                break
+            valid.append(record)
+        decided = state["decided"]
+        if invalid_at is not None:
+            decided = {index: anchor for index, anchor in decided.items() if index < invalid_at}
+        else:
+            decided = {index: anchor for index, anchor in decided.items()
+                       if index < len(items) and item_hash(items[index]) == anchor}
+        if valid != records or decided != state["decided"]:
+            state["records"] = valid
+            state["decided"] = decided
+            state["version"] += 1
+        return state
+
+    def _state_snapshot(self, key, items):
+        with self.state_lock:
+            state = self.states.get(key)
+            if state is None:
+                state = {"records": [], "decided": {}, "version": 0}
+                self.states[key] = state
+                if len(self.states) > STATE_LIMIT:
+                    self.states.popitem(last=False)
+            self.states.move_to_end(key)
+            self._normalize_state(state, items)
+            return state["version"], list(state["records"]), dict(state["decided"])
+
+    def _commit(self, key, items, index, version, records, decided, effort):
+        with self.state_lock:
+            state = self.states.get(key)
+            if state is None:
+                return records, False
+            self._normalize_state(state, items)
+            inserted = False
+            if (state["version"] == version and state["records"] == records and
+                    state["decided"] == decided and index not in state["decided"] and
+                    not any(record[0] == index for record in state["records"])):
+                if effort is not None and len(state["records"]) < RECORD_LIMIT:
+                    state["records"].append((index, item_hash(items[index]), effort))
+                    state["records"].sort(key=lambda record: record[0])
+                    inserted = True
+                state["decided"][index] = item_hash(items[index])
+                state["version"] += 1
+            self.states.move_to_end(key)
+            return list(state["records"]), inserted
+
+    def _with_records(self, body, protocol, records):
+        if not records:
+            return body
+        key = "messages" if protocol == "claude" else "input"
+        result = copy.deepcopy(body)
+        updates = {index: effort for index, _, effort in records}
+        items = []
+        for index, item in enumerate(result[key]):
+            if index in updates:
+                items.append({"role": "system", "content": [], "output_config": {"effort": updates[index]}}
+                             if protocol == "claude" else
+                             {"type": "configuration_update", "reasoning": {"effort": updates[index]}})
+            items.append(item)
+        result[key] = items
+        return result
+
+    def _finish(self, body, protocol, key, items, index, version, records, decided, effort,
+                log=None):
+        final_records, inserted = self._commit(key, items, index, version, records, decided, effort)
+        result = self._with_records(body, protocol, final_records)
+        if inserted and log:
+            note(log)
+        elif final_records:
+            note(f"harness={protocol} replayed={len(final_records)}")
+        return result
+
+    def rewrite(self, body, protocol="codex", threshold=None, capabilities=None, conversation_id=None):
         model = body.get("model", "")
         if protocol == "claude":
-            levels = list(LEVELS) if CLAUDE_MAX.fullmatch(model) else []
-            if re.fullmatch(r"claude-(?:opus-4-6|sonnet-4-6|mythos-preview)(?:-\d{8})?", model):
-                levels = [level for level in levels if level != "xhigh"]
-            if re.fullmatch(r"claude-opus-4-5(?:-\d{8})?", model):
-                levels = ["low", "medium", "high"]
+            levels = list(LEVELS) if model in CLAUDE_MODELS else []
             if body.get("thinking", {}).get("type") == "disabled":
                 levels = [level for level in levels if level not in ("max", "xhigh")]
         else:
-            levels = (capabilities or self.models).get(model, [])
+            if model not in CODEX_MODELS:
+                note("unchanged: model capabilities unavailable")
+                return body
+            levels = (self.models if capabilities is None else capabilities).get(model, [])
         available = [level for level in LEVELS if level in levels]
-        items = body.get("messages" if protocol == "claude" else "input", [])
+        items_key = "messages" if protocol == "claude" else "input"
+        items = body.get(items_key, [])
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            note("unchanged: unsupported input shape")
+            return body
         if has_media(items):
             note("unchanged: non-text context")
             return body
         if not available or "low" not in available:
             note("unchanged: model capabilities unavailable")
             return body
-        if isinstance(items, list) and any(isinstance(i, dict) and
-                (i.get("type") == "configuration_update" or "output_config" in i) for i in items):
+        if any((protocol == "codex" and item.get("type") == "configuration_update") or
+                (protocol == "claude" and item.get("role") == "system" and item.get("content", []) == [] and
+                 "output_config" in item) for item in items):
             note("unchanged: per-message effort override in history")
             return body
+        if protocol == "codex":
+            reasoning = body.get("reasoning")
+            extra_reasoning = set(reasoning or {}) - {"effort", "summary"} if isinstance(reasoning, dict) else set()
+            # ponytail: Codex 0.153.2 emits context=all_turns metadata; other modes bypass routing.
+            if (not isinstance(reasoning, (dict, type(None))) or
+                    (extra_reasoning and not (extra_reasoning == {"context"} and
+                                              reasoning.get("context") == "all_turns")) or
+                    "context_management" in body or
+                    ("truncation" in body and body["truncation"] != "disabled") or
+                    ("previous_response_id" in body and body["previous_response_id"] is not None) or
+                    any(item.get("type") == "compaction" for item in items)):
+                note("unchanged: unsupported conversation mode")
+                return body
+        conversation_id = self._conversation_id(body, protocol, conversation_id)
+        if not conversation_id or not items:
+            note("unchanged: conversation key unavailable")
+            return body
+        insertion = claude_boundary(items) if protocol == "claude" else codex_boundary(items)
+        try:
+            key = self._state_key(protocol, model, conversation_id, items)
+        except (TypeError, ValueError):
+            note("unchanged: unsupported input shape")
+            return body
+        version, records, decided = self._state_snapshot(key, items)
+        if insertion is None:
+            result = self._with_records(body, protocol, records)
+            if records:
+                note(f"harness={protocol} replayed={len(records)}")
+            return result
+        anchor = item_hash(items[insertion])
+        if (decided.get(insertion) == anchor or any(record[0] == insertion for record in records)):
+            result = self._with_records(body, protocol, records)
+            if records:
+                note(f"harness={protocol} replayed={len(records)}")
+            return result
+        if len(records) >= RECORD_LIMIT:
+            return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
         state = claude_context(body) if protocol == "claude" else context_for(body)
         if not state:
-            return body
+            return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
+        previous = [record for record in records if record[0] < insertion]
+        top = body.get("output_config" if protocol == "claude" else "reasoning")
+        effective = previous[-1][2] if previous else (top.get("effort") if isinstance(top, dict) else None)
         start = time.monotonic()
         try:
             with self.lock:
                 if self.pending is not None and not self.pending.done():
                     note("unchanged: classifier busy")
-                    return body
+                    return self._with_records(body, protocol, records)
                 self.pending = self.executor.submit(self.agent.predict, state, QUESTION)
                 future = self.pending
             answer = future.result(timeout=self.timeout)["answers"]["effort"]
@@ -164,18 +367,18 @@ class Router:
                 raise ValueError("invalid prediction")
             if confidence < (self.threshold if threshold is None else threshold):
                 note(f"unchanged: confidence={confidence:.2f}")
-                return body
+                return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
             effort = next((level for level in available
                            if LEVELS.index(level) >= LEVELS.index(answer["choice"])), available[-1])
-            result = copy.deepcopy(body)
-            key = "output_config" if protocol == "claude" else "reasoning"
-            result[key] = {**(result.get(key) or {}), "effort": effort}
-            note(f"harness={protocol} effort={effort} probability={confidence:.2f} classifier_ms={(time.monotonic()-start)*1000:.0f}")
-            return result
+            return self._finish(body, protocol, key, items, insertion, version, records, decided,
+                                effort if effort != effective else None,
+                                f"harness={protocol} effort={effort} inserted_at={insertion} "
+                                f"replayed={len(records)} probability={confidence:.2f} "
+                                f"classifier_ms={(time.monotonic()-start)*1000:.0f}")
         except Exception as exc:
             # Exception messages may contain input data, so log only their class.
             note(f"unchanged: classifier {type(exc).__name__}")
-            return body
+            return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
 
     def close(self):
         # The daemon must retain its lifetime lock until the model worker has stopped.
@@ -258,6 +461,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         upstream = None
         started = False
+        rewrote = False
         try:
             data = self.rfile.read(size)
             if len(data) != size:
@@ -283,12 +487,17 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, UnicodeDecodeError):
                     self.send_error(400, "Invalid inference request")
                     return
-                rewritten = self.server.router.rewrite(body, protocol, threshold, capabilities)
+                conversation_id = self.headers.get("session-id") if protocol == "codex" else self.headers.get(
+                    "X-Claude-Code-Session-Id")
+                rewritten = self.server.router.rewrite(body, protocol, threshold, capabilities, conversation_id)
                 if rewritten is not body:
+                    rewrote = True
                     data = json.dumps(rewritten, ensure_ascii=False).encode()
             connection = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
             upstream = connection(target.hostname, target.port, timeout=600)
             headers = forwarded_headers(self.headers)
+            if protocol == "claude" and rewrote:
+                append_claude_beta(headers)
             headers["Content-Length"] = str(len(data))
             headers["Connection"] = "close"
             upstream.request(self.command, target.path.rstrip("/") + forward_path, data, headers)
