@@ -95,6 +95,9 @@ class RoutingTests(unittest.TestCase):
             classifier.choice = "low"
             second = route(router, body)
             self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(second)], ["max", "low"])
+            self.assertEqual(
+                [json.dumps(i, ensure_ascii=False) for i in second["input"][:len(first["input"])]],
+                [json.dumps(i, ensure_ascii=False) for i in first["input"]])
             body["input"][-1]["output"] = "microcompacted"
             body["input"][-1]["cache_control"] = {"type": "ephemeral"}
             before = len(classifier.states)
@@ -106,6 +109,9 @@ class RoutingTests(unittest.TestCase):
             third = route(router, body)
             self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(third)], ["max", "low"])
             self.assertEqual(third["input"][3]["type"], "configuration_update")
+            self.assertEqual(
+                [json.dumps(i, ensure_ascii=False) for i in third["input"][:len(replay["input"])]],
+                [json.dumps(i, ensure_ascii=False) for i in replay["input"]])
 
             claude = {"model": "claude-opus-5-5", "thinking": {"type": "adaptive"},
                       "output_config": {"effort": "low"},
@@ -120,6 +126,9 @@ class RoutingTests(unittest.TestCase):
             classifier.choice = "low"
             second = route(router, claude, "claude", conversation_id="claude-session")
             self.assertEqual([u["output_config"]["effort"] for u in effort_updates(second, "claude")], ["max", "low"])
+            self.assertEqual(
+                [json.dumps(i, ensure_ascii=False) for i in second["messages"][:len(first["messages"])]],
+                [json.dumps(i, ensure_ascii=False) for i in first["messages"]])
             claude["messages"][0]["cache_control"] = {"type": "ephemeral"}
             claude["messages"][-1]["content"][0]["content"] = "microcompacted"
             before = len(classifier.states)
@@ -131,6 +140,9 @@ class RoutingTests(unittest.TestCase):
             third = route(router, claude, "claude", conversation_id="claude-session")
             self.assertEqual([u["output_config"]["effort"] for u in effort_updates(third, "claude")], ["max", "low", "max"])
             self.assertEqual(third["messages"][-2]["role"], "system")
+            self.assertEqual(
+                [json.dumps(i, ensure_ascii=False) for i in third["messages"][:len(replay["messages"])]],
+                [json.dumps(i, ensure_ascii=False) for i in replay["messages"]])
             claude["messages"][2]["content"][0]["tool_use_id"] = "rewritten-tool"
             classifier.choice = "low"
             rewritten = route(router, claude, "claude", conversation_id="claude-session")
@@ -164,6 +176,37 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual(len(equal_classifier.states), 1)
             finally:
                 equal_router.close()
+        finally:
+            router.close()
+
+    def test_history_edit_drops_stale_decision_before_later_record(self):
+        classifier = Classifier("low")
+        router = Router(classifier, {"gpt-6-astra": ["low", "max"]})
+        body = request()
+        body["reasoning"]["effort"] = "high"
+        try:
+            first = route(router, body)
+            self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(first)], ["low"])
+            body["input"].extend([{"role": "assistant", "content": "First result"},
+                                  {"role": "user", "content": "Second turn"}])
+            second = route(router, body)
+            self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(second)], ["low"])
+            body["input"].extend([{"role": "assistant", "content": "Second result"},
+                                  {"role": "user", "content": "Third turn"}])
+            classifier.choice = "max"
+            third = route(router, body)
+            self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(third)], ["low", "max"])
+
+            edited = copy.deepcopy(body)
+            edited["input"][2]["content"] = "Edited second turn"
+            edited["input"] = edited["input"][:3]
+            calls = len(classifier.states)
+            rerouted = route(router, edited)
+            self.assertEqual(len(classifier.states), calls + 1)
+            self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(rerouted)], ["low", "max"])
+            self.assertEqual(len(classifier.states), calls + 1)
+            self.assertEqual(route(router, edited), rerouted)
+            self.assertEqual(len(classifier.states), calls + 1)
         finally:
             router.close()
 
@@ -205,6 +248,54 @@ class RoutingTests(unittest.TestCase):
             router.close()
 
     def test_concurrent_same_key_requests_do_not_duplicate_updates(self):
+        a_ready, b_committed, allow_a = (threading.Event() for _ in range(3))
+        classifier = Classifier("max")
+        predict = classifier.predict
+
+        def sequenced(*args):
+            classifier.choice = "max" if not classifier.states else "low"
+            return predict(*args)
+
+        classifier.predict = sequenced
+        router = Router(classifier, {"gpt-6-astra": ["low", "max"]})
+        original_finish = router._finish
+
+        def delayed_finish(*args, **kwargs):
+            if threading.current_thread().name == "request-a":
+                a_ready.set()
+                allow_a.wait(2)
+            result = original_finish(*args, **kwargs)
+            if threading.current_thread().name == "request-b":
+                b_committed.set()
+            return result
+
+        router._finish = delayed_finish
+        body = request()
+        body["reasoning"]["effort"] = "high"
+        results = {}
+
+        def run(name):
+            results[name] = route(router, copy.deepcopy(body), conversation_id="concurrent")
+
+        first = threading.Thread(target=run, args=("request-a",), name="request-a")
+        first.start()
+        try:
+            self.assertTrue(a_ready.wait(1))
+            second = threading.Thread(target=run, args=("request-b",), name="request-b")
+            second.start()
+            self.assertTrue(b_committed.wait(1))
+            allow_a.set()
+            second.join(2)
+            first.join(2)
+            self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(results["request-b"])], ["low"])
+            self.assertEqual([u["reasoning"]["effort"] for u in effort_updates(results["request-a"])], ["low"])
+            self.assertEqual(len(next(iter(router.states.values()))["records"]), 1)
+        finally:
+            allow_a.set()
+            first.join(2)
+            router.close()
+
+    def test_busy_classifier_marks_insertion_point_decided(self):
         started, release = threading.Event(), threading.Event()
         classifier = Classifier("max")
         predict = classifier.predict
@@ -216,24 +307,27 @@ class RoutingTests(unittest.TestCase):
 
         classifier.predict = blocked
         router = Router(classifier, {"gpt-6-astra": ["low", "max"]})
-        body = request()
-        body["reasoning"]["effort"] = "low"
-        results = []
-
-        def run():
-            results.append(route(router, copy.deepcopy(body), conversation_id="concurrent"))
-
-        first = threading.Thread(target=run)
-        first.start()
-        self.assertTrue(started.wait(1))
-        second = threading.Thread(target=run)
-        second.start()
-        second.join(1)
-        release.set()
-        first.join(2)
+        first_body = request()
+        first_body["reasoning"]["effort"] = "high"
+        busy_body = copy.deepcopy(first_body)
+        busy_body["input"].extend([{"role": "assistant", "content": "First result"},
+                                    {"role": "user", "content": "Second turn"}])
+        first = []
+        thread = threading.Thread(target=lambda: first.append(route(router, first_body, conversation_id="busy-a")))
+        thread.start()
         try:
-            self.assertEqual(sum(len(effort_updates(result)) for result in results), 1)
+            self.assertTrue(started.wait(1))
+            self.assertIs(route(router, busy_body, conversation_id="busy-b"), busy_body)
+            release.set()
+            thread.join(2)
+            calls = len(classifier.states)
+            classifier.choice = "low"
+            routed = route(router, busy_body, conversation_id="busy-b")
+            self.assertEqual(len(classifier.states), calls)
+            self.assertEqual(effort_updates(routed), [])
         finally:
+            release.set()
+            thread.join(2)
             router.close()
 
     def test_codex_bypasses_unsupported_modes_but_claude_context_clear_routes(self):
@@ -261,6 +355,20 @@ class RoutingTests(unittest.TestCase):
                       "messages": [{"role": "user", "content": "Route this"}]}
             routed = route(router, claude, "claude", conversation_id="claude-clear")
             self.assertEqual(routed["messages"][0]["output_config"]["effort"], "max")
+        finally:
+            router.close()
+
+    def test_codex_all_turns_context_routes_and_other_context_values_pass_through(self):
+        router = Router(Classifier("max"), {"gpt-6-astra": ["low", "max"]})
+        try:
+            body = request()
+            body["reasoning"]["context"] = "all_turns"
+            routed = route(router, body, conversation_id="all-turns")
+            self.assertEqual(routed["input"][0]["reasoning"]["effort"], "max")
+            for index, context in enumerate(("last_turn", "none", None)):
+                body = request()
+                body["reasoning"]["context"] = context
+                self.assertIs(route(router, body, conversation_id=f"context-{index}"), body)
         finally:
             router.close()
 
@@ -576,6 +684,44 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(beta[0].lower().count("mid-conversation-output-config-2026-07-01"), 1)
             self.assertEqual(beta[1], "existing-beta,mid-conversation-output-config-2026-07-01")
             self.assertEqual(beta[2], "existing-beta,mid-conversation-output-config-2026-07-01")
+        finally:
+            proxy.shutdown()
+            proxy.server_close()
+            router.close()
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_claude_count_tokens_forwards_original_body_without_beta(self):
+        received = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append((self.rfile.read(int(self.headers["Content-Length"])),
+                                 {key.lower(): value for key, value in self.headers.items()}))
+                payload = b"{}"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        router = Router(Classifier("max"), {})
+        proxy = Proxy(router, None, "secret")
+        proxy.upstreams["anthropic"] = f"http://127.0.0.1:{upstream.server_port}"
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        body = b'{"model": "claude-opus-5-5", "messages": [{"role": "user", "content": "count"}]}'
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_port)
+            conn.request("POST", "/anthropic/v1/messages/count_tokens", body,
+                         {"Content-Type": "application/json", "X-Laya-Advisor-Token": "secret"})
+            self.assertEqual(conn.getresponse().status, 200)
+            conn.close()
+            self.assertEqual(received[0][0], body)
+            self.assertNotIn("anthropic-beta", received[0][1])
         finally:
             proxy.shutdown()
             proxy.server_close()

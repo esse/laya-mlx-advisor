@@ -139,8 +139,9 @@ pass through. To supply known capabilities explicitly:
 ./bin/codex-laya --target-model gpt-6-astra --efforts low,medium,high,xhigh,max
 ```
 
-Neither harness is upgraded to `ultra`. Token-counting and compaction endpoints
-are forwarded without classification.
+Neither harness is upgraded to `ultra`; Claude requests with thinking explicitly
+disabled are capped at `high`. Token-counting and compaction endpoints are
+forwarded without classification.
 
 Cache-safe routing is enabled only for Claude `claude-fable-5-1`,
 `claude-mythos-5-1`, `claude-opus-5-5`, and `claude-opus-5`, plus Codex

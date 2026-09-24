@@ -215,7 +215,8 @@ class Router:
             valid.append(record)
         decided = state["decided"]
         if invalid_at is not None:
-            decided = {index: anchor for index, anchor in decided.items() if index < invalid_at}
+            decided = {index: anchor for index, anchor in decided.items()
+                       if index < invalid_at and index < len(items) and item_hash(items[index]) == anchor}
         else:
             decided = {index: anchor for index, anchor in decided.items()
                        if index < len(items) and item_hash(items[index]) == anchor}
@@ -358,7 +359,7 @@ class Router:
             with self.lock:
                 if self.pending is not None and not self.pending.done():
                     note("unchanged: classifier busy")
-                    return self._with_records(body, protocol, records)
+                    return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
                 self.pending = self.executor.submit(self.agent.predict, state, QUESTION)
                 future = self.pending
             answer = future.result(timeout=self.timeout)["answers"]["effort"]
