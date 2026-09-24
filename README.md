@@ -122,8 +122,9 @@ tradeoff on your own tasks before relying on savings.
 The default decision threshold is **0.70 winning-class probability**. Laya's
 separate entropy-derived `confidence` field is deliberately not used. Tune it per
 launcher, for example `./bin/claude-laya --threshold 0.85`. Below the threshold,
-on an error, while inference is busy, or after a two-second deadline, the original
-request is forwarded unchanged. Routing decisions appear in the daemon log.
+on an error, while inference is busy, or after a two-second deadline, no new
+update is added; earlier committed updates are replayed. Routing decisions appear
+in the daemon log.
 
 The five choices describe mechanical work (`low`), routine implementation
 (`medium`), multistep debugging (`high`), complex interactions (`xhigh`), and
@@ -147,10 +148,12 @@ Cache-safe routing is enabled only for Claude `claude-fable-5-1`,
 `claude-mythos-5-1`, `claude-opus-5-5`, and `claude-opus-5`, plus Codex
 `gpt-6-astra`, `gpt-6-sol`, and `gpt-6-luna` when their catalog or explicit
 capabilities list includes `low`. For these models, the proxy keeps the
-harness-authored top-level effort unchanged and inserts per-message effort
-updates before new user/tool-result items, then replays those updates at their
-original positions on later requests. Unsupported models, media, provider
-compaction modes, and existing per-message overrides pass through untouched.
+harness-authored top-level effort unchanged. Codex updates precede new
+user/developer or tool-result items; Claude updates are appended after Claude
+Code's own trailing effort messages, and the router overrides those per-message
+efforts. Updates are replayed at their original positions on later requests.
+Unsupported models, media, provider
+compaction modes, and Codex's existing per-message overrides pass through untouched.
 
 Routing state is bounded in memory, so a daemon restart, LRU eviction, or
 history rewrite may cause cache misses. A classifier timeout, error, or low

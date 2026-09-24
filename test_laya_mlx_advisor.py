@@ -14,7 +14,8 @@ import unittest
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from scripts.laya_mlx_advisor import CLAUDE_BETA, Router, Proxy, context_for, launch_args, claude_env, read_models
+from scripts.laya_mlx_advisor import (CLAUDE_BETA, Router, Proxy, context_for, launch_args,
+                                       claude_env, normalized_item, read_models)
 
 
 class Classifier:
@@ -119,6 +120,7 @@ class RoutingTests(unittest.TestCase):
             classifier.choice = "max"
             first = route(router, claude, "claude", conversation_id="claude-session")
             self.assertEqual([u["output_config"]["effort"] for u in effort_updates(first, "claude")], ["max"])
+            self.assertEqual(first["messages"][-1]["output_config"]["effort"], "max")
             claude["messages"].extend([
                 {"role": "assistant", "content": [{"type": "tool_use", "id": "tool-1", "name": "shell", "input": {}}]},
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "old"}]},
@@ -126,6 +128,7 @@ class RoutingTests(unittest.TestCase):
             classifier.choice = "low"
             second = route(router, claude, "claude", conversation_id="claude-session")
             self.assertEqual([u["output_config"]["effort"] for u in effort_updates(second, "claude")], ["max", "low"])
+            self.assertEqual(second["messages"][-1]["output_config"]["effort"], "low")
             self.assertEqual(
                 [json.dumps(i, ensure_ascii=False) for i in second["messages"][:len(first["messages"])]],
                 [json.dumps(i, ensure_ascii=False) for i in first["messages"]])
@@ -139,7 +142,7 @@ class RoutingTests(unittest.TestCase):
             classifier.choice = "max"
             third = route(router, claude, "claude", conversation_id="claude-session")
             self.assertEqual([u["output_config"]["effort"] for u in effort_updates(third, "claude")], ["max", "low", "max"])
-            self.assertEqual(third["messages"][-2]["role"], "system")
+            self.assertEqual(third["messages"][-1]["role"], "system")
             self.assertEqual(
                 [json.dumps(i, ensure_ascii=False) for i in third["messages"][:len(replay["messages"])]],
                 [json.dumps(i, ensure_ascii=False) for i in replay["messages"]])
@@ -147,6 +150,30 @@ class RoutingTests(unittest.TestCase):
             classifier.choice = "low"
             rewritten = route(router, claude, "claude", conversation_id="claude-session")
             self.assertEqual([u["output_config"]["effort"] for u in effort_updates(rewritten, "claude")], ["max", "low"])
+        finally:
+            router.close()
+
+    def test_claude_routes_over_harness_effort_and_appends_update(self):
+        classifier = Classifier("medium")
+        router = Router(classifier, {})
+        body = {"model": "claude-opus-5-5", "thinking": {"type": "adaptive"},
+                "output_config": {"effort": "low"},
+                "messages": [{"role": "user", "content": "Start"},
+                             {"role": "system", "content": [],
+                              "output_config": {"effort": "medium"}}]}
+        try:
+            unchanged = route(router, body, "claude", conversation_id="harness-effort")
+            self.assertEqual(unchanged, body)
+            self.assertEqual(len(classifier.states), 1)
+
+            classifier.choice = "low"
+            routed_body = copy.deepcopy(body)
+            routed_body["messages"][0]["content"] = "Route over it"
+            routed = route(router, routed_body, "claude", conversation_id="harness-update")
+            self.assertEqual(routed["messages"][1], routed_body["messages"][1])
+            self.assertEqual(routed["messages"][-1],
+                             {"role": "system", "content": [],
+                              "output_config": {"effort": "low"}})
         finally:
             router.close()
 
@@ -207,6 +234,7 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(len(classifier.states), calls + 1)
             self.assertEqual(route(router, edited), rerouted)
             self.assertEqual(len(classifier.states), calls + 1)
+            self.assertEqual(next(iter(router.states.values()))["decided"][0], 2)
         finally:
             router.close()
 
@@ -295,6 +323,44 @@ class RoutingTests(unittest.TestCase):
             first.join(2)
             router.close()
 
+    def test_shorter_stale_commit_does_not_delete_longer_replay(self):
+        ready, release = threading.Event(), threading.Event()
+        classifier = Classifier("max")
+        router = Router(classifier, {"gpt-6-astra": ["low", "max"]})
+        original_finish = router._finish
+
+        def delayed_finish(*args, **kwargs):
+            if threading.current_thread().name == "shorter":
+                ready.set()
+                release.wait(2)
+            return original_finish(*args, **kwargs)
+
+        router._finish = delayed_finish
+        shorter = request()
+        shorter["reasoning"]["effort"] = "high"
+        longer = copy.deepcopy(shorter)
+        longer["input"].extend([{"role": "assistant", "content": "First result"},
+                                 {"role": "user", "content": "Second turn"}])
+
+        def run_shorter():
+            route(router, shorter, conversation_id="overlap")
+
+        thread = threading.Thread(target=run_shorter, name="shorter")
+        thread.start()
+        try:
+            self.assertTrue(ready.wait(1))
+            longer_result = route(router, longer, conversation_id="overlap")
+            calls = len(classifier.states)
+            release.set()
+            thread.join(2)
+            self.assertEqual(route(router, longer, conversation_id="overlap"), longer_result)
+            self.assertEqual(len(classifier.states), calls)
+            self.assertEqual(len(next(iter(router.states.values()))["records"]), 1)
+        finally:
+            release.set()
+            thread.join(2)
+            router.close()
+
     def test_busy_classifier_marks_insertion_point_decided(self):
         started, release = threading.Event(), threading.Event()
         classifier = Classifier("max")
@@ -354,7 +420,7 @@ class RoutingTests(unittest.TestCase):
                       "output_config": {"effort": "low"},
                       "messages": [{"role": "user", "content": "Route this"}]}
             routed = route(router, claude, "claude", conversation_id="claude-clear")
-            self.assertEqual(routed["messages"][0]["output_config"]["effort"], "max")
+            self.assertEqual(routed["messages"][-1]["output_config"]["effort"], "max")
         finally:
             router.close()
 
@@ -388,7 +454,7 @@ class RoutingTests(unittest.TestCase):
                         body[key]["effort"] = "low" if level != "low" else "high"
                         result = route(router, body, protocol, conversation_id=f"session-{level}")
                         self.assertEqual(result[key]["effort"], body[key]["effort"])
-                        update = result["input" if protocol == "codex" else "messages"][0]
+                        update = result["input" if protocol == "codex" else "messages"][0 if protocol == "codex" else -1]
                         self.assertEqual(update.get("reasoning", update.get("output_config"))["effort"], level)
             finally:
                 router.close()
@@ -403,7 +469,7 @@ class RoutingTests(unittest.TestCase):
             for model in ("claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5"):
                 body = {"model": model, "messages": [{"role": "user", "content": "Investigate this task"}]}
                 result = route(router, body, "claude", conversation_id=model)
-                self.assertEqual(result["messages"][0]["output_config"]["effort"], "xhigh")
+                self.assertEqual(result["messages"][-1]["output_config"]["effort"], "xhigh")
             classifier.choice = "medium"
             router.models = {"gpt-6-astra": ["low", "high"]}
             capped_body = request()
@@ -421,7 +487,7 @@ class RoutingTests(unittest.TestCase):
             with patch.dict(os.environ, {"CODEX_HOME": folder}):
                 self.assertEqual(read_models(), {"gpt-6-astra": ["low", "high", "max"]})
 
-    def test_claude_rewrites_effort_each_request_without_changing_thinking_or_history(self):
+    def test_claude_updates_effort_without_changing_thinking_or_history(self):
         classifier = Classifier()
         router = Router(classifier, {})
         body = {"model": "claude-opus-5-5", "max_tokens": 4096, "stream": True,
@@ -430,7 +496,7 @@ class RoutingTests(unittest.TestCase):
         original = copy.deepcopy(body)
         first = route(router, body, "claude")
         self.assertEqual(first["output_config"]["effort"], "high")
-        self.assertEqual(first["messages"][0]["output_config"]["effort"], "low")
+        self.assertEqual(first["messages"][-1]["output_config"]["effort"], "low")
         self.assertEqual(body, original)
         body["messages"].extend([
             {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash", "id": "t1", "input": {"command": "test"}}]},
@@ -439,10 +505,9 @@ class RoutingTests(unittest.TestCase):
         classifier.choice = "max"
         changed = route(router, body, "claude")
         self.assertEqual(changed["output_config"]["effort"], "high")
-        self.assertEqual(changed["messages"][1], body["messages"][0])
         self.assertEqual(changed["messages"][2], body["messages"][1])
-        self.assertEqual(changed["messages"][3]["output_config"]["effort"], "max")
-        self.assertEqual(changed["messages"][4], body["messages"][2])
+        self.assertEqual(changed["messages"][3], body["messages"][2])
+        self.assertEqual(changed["messages"][-1]["output_config"]["effort"], "max")
         self.assertIn("Unexplained race", classifier.states[-1])
         self.assertIn("Fix the parser", classifier.states[-1])
         body["model"] = "claude-opus-5"
@@ -450,7 +515,7 @@ class RoutingTests(unittest.TestCase):
         body["output_config"]["effort"] = "low"
         disabled = route(router, body, "claude", conversation_id="disabled")
         self.assertEqual(disabled["output_config"]["effort"], "low")
-        self.assertEqual(disabled["messages"][2]["output_config"]["effort"], "high")
+        self.assertEqual(disabled["messages"][-1]["output_config"]["effort"], "high")
         body["model"] = "unknown-claude"
         self.assertEqual(route(router, body, "claude", conversation_id="unknown"), body)
 
@@ -498,7 +563,9 @@ class RoutingTests(unittest.TestCase):
         claude = {"model": "claude-opus-5-5", "thinking": {"type": "adaptive"},
                   "messages": [{"role": "system", "content": [], "output_config": {"effort": "low"}},
                                {"role": "user", "content": "Do not route"}]}
-        self.assertIs(route(router, claude, "claude", conversation_id="claude-override"), claude)
+        router.agent.choice = "max"
+        routed = route(router, claude, "claude", conversation_id="claude-override")
+        self.assertEqual(routed["messages"][-1]["output_config"]["effort"], "max")
 
     def test_caps_at_supported_effort_without_selecting_ultra(self):
         for levels, expected in [(["low", "high", "xhigh"], "xhigh"),
@@ -893,12 +960,20 @@ class RoutingTests(unittest.TestCase):
                                  if m.get("content") == [] and m.get("output_config")]
                 second_updates = [m for m in claude_received[1]["messages"]
                                   if m.get("content") == [] and m.get("output_config")]
-                self.assertEqual(first_updates, [])
-                self.assertEqual([message["output_config"]["effort"] for message in second_updates], ["low"])
+                self.assertEqual([message["output_config"]["effort"] for message in first_updates], ["max"])
+                self.assertEqual(claude_received[0]["messages"][-1], first_updates[-1])
+                self.assertEqual([message["output_config"]["effort"] for message in second_updates], ["max", "low"])
+                self.assertEqual(claude_received[1]["messages"][-1], second_updates[-1])
+                self.assertEqual(
+                    [json.dumps(normalized_item(message), ensure_ascii=False)
+                     for message in claude_received[1]["messages"][:len(claude_received[0]["messages"])]],
+                    [json.dumps(normalized_item(message), ensure_ascii=False)
+                     for message in claude_received[0]["messages"]])
                 final_tool_result = [i for i, message in enumerate(claude_received[-1]["messages"])
                                      if any(isinstance(block, dict) and block.get("type") == "tool_result"
                                             for block in message.get("content", []))][-1]
-                self.assertEqual(claude_received[-1]["messages"][final_tool_result - 1]["output_config"]["effort"], "low")
+                self.assertLess(final_tool_result, len(claude_received[-1]["messages"]) - 1)
+                self.assertEqual(claude_received[-1]["messages"][-1]["output_config"]["effort"], "low")
                 tool_results = [b for m in claude_received[-1]["messages"] if isinstance(m["content"], list)
                                 for b in m["content"] if b.get("type") == "tool_result"]
                 self.assertTrue(any("confirmed result" in str(b.get("content")) and not b.get("is_error") for b in tool_results))

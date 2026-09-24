@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLAUDE_MODELS = {"claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5", "claude-opus-5"}
 CODEX_MODELS = {"gpt-6-astra", "gpt-6-sol", "gpt-6-luna"}
 CLAUDE_BETA = "mid-conversation-output-config-2026-07-01"
+CLAUDE_SENTINEL = "claude-start"
 STATE_LIMIT = 128
 RECORD_LIMIT = 64
 QUESTION = {"effort": {
@@ -125,6 +126,11 @@ def normalized_item(value):
             return {"type": kind, "tool_use_id": value.get("tool_use_id")}
         if kind in ("function_call_output", "custom_tool_call_output"):
             return {"type": kind, "call_id": value.get("call_id")}
+        content = value.get("content")
+        if (isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict) and
+                content[0].get("type") == "text" and
+                set(content[0]) <= {"type", "text", "cache_control"}):
+            value = {**value, "content": content[0].get("text", "")}
         return {key: normalized_item(item) for key, item in value.items() if key != "cache_control"}
     if isinstance(value, list):
         return [normalized_item(item) for item in value]
@@ -152,14 +158,14 @@ def append_claude_beta(headers):
 
 
 def claude_boundary(items):
-    if not items or items[-1].get("role") != "user":
-        return None
-    content = items[-1].get("content")
-    if isinstance(content, str):
-        return len(items) - 1 if content else None
-    if isinstance(content, list) and any(isinstance(block, dict) and
-            block.get("type") in ("text", "tool_result") for block in content):
-        return len(items) - 1
+    for item in reversed(items):
+        if item.get("role") == "assistant":
+            break
+        content = item.get("content")
+        if item.get("role") == "user" and ((isinstance(content, str) and content) or
+                (isinstance(content, list) and any(isinstance(block, dict) and
+                 block.get("type") in ("text", "tool_result") for block in content))):
+            return len(items)
     return None
 
 
@@ -203,64 +209,86 @@ class Router:
         # ponytail: first-item hashing separates normal branches; identical first items can still collide.
         return hashlib.sha256(value.encode()).hexdigest()
 
-    def _normalize_state(self, state, items):
+    def _record_anchor(self, protocol, items, index):
+        return (CLAUDE_SENTINEL if protocol == "claude" and index == 0 else
+                item_hash(items[index - 1] if protocol == "claude" else items[index]))
+
+    def _anchor_matches(self, protocol, items, index, anchor):
+        if (protocol == "claude" and index > len(items)) or (protocol != "claude" and index >= len(items)):
+            return None
+        return self._record_anchor(protocol, items, index) == anchor
+
+    def _normalize_state(self, state, protocol, items):
         records = state["records"]
         valid = []
         invalid_at = None
         for record in records:
             index, anchor, _ = record
-            if index >= len(items) or item_hash(items[index]) != anchor:
+            matches = self._anchor_matches(protocol, items, index, anchor)
+            if matches is None:
+                break
+            if not matches:
                 invalid_at = index
                 break
             valid.append(record)
+        normalized_records = valid if invalid_at is not None else records
         decided = state["decided"]
-        if invalid_at is not None:
-            decided = {index: anchor for index, anchor in decided.items()
-                       if index < invalid_at and index < len(items) and item_hash(items[index]) == anchor}
-        else:
-            decided = {index: anchor for index, anchor in decided.items()
-                       if index < len(items) and item_hash(items[index]) == anchor}
-        if valid != records or decided != state["decided"]:
-            state["records"] = valid
+        if decided is not None:
+            index, anchor = decided
+            matches = self._anchor_matches(protocol, items, index, anchor)
+            if (invalid_at is not None and index >= invalid_at) or matches is False:
+                decided = None
+        if normalized_records != records or decided != state["decided"]:
+            state["records"] = normalized_records
             state["decided"] = decided
             state["version"] += 1
         return state
 
-    def _state_snapshot(self, key, items):
+    def _state_snapshot(self, key, protocol, items):
         with self.state_lock:
             state = self.states.get(key)
             if state is None:
-                state = {"records": [], "decided": {}, "version": 0}
+                state = {"records": [], "decided": None, "version": 0}
                 self.states[key] = state
                 if len(self.states) > STATE_LIMIT:
                     self.states.popitem(last=False)
             self.states.move_to_end(key)
-            self._normalize_state(state, items)
-            return state["version"], list(state["records"]), dict(state["decided"])
+            self._normalize_state(state, protocol, items)
+            return state["version"], list(state["records"]), state["decided"]
 
-    def _commit(self, key, items, index, version, records, decided, effort):
+    def _commit(self, key, protocol, items, index, version, records, decided, effort):
         with self.state_lock:
             state = self.states.get(key)
             if state is None:
                 return records, False
-            self._normalize_state(state, items)
+            if (state["version"] != version or state["records"] != records or
+                    state["decided"] != decided):
+                self.states.move_to_end(key)
+                return list(state["records"]), False
             inserted = False
-            if (state["version"] == version and state["records"] == records and
-                    state["decided"] == decided and index not in state["decided"] and
+            anchor = self._record_anchor(protocol, items, index)
+            if (state["decided"] != (index, anchor) and
                     not any(record[0] == index for record in state["records"])):
                 if effort is not None and len(state["records"]) < RECORD_LIMIT:
-                    state["records"].append((index, item_hash(items[index]), effort))
+                    state["records"] = [record for record in state["records"] if record[0] < index]
+                    state["records"].append((index, anchor, effort))
                     state["records"].sort(key=lambda record: record[0])
                     inserted = True
-                state["decided"][index] = item_hash(items[index])
+                state["decided"] = (index, anchor)
                 state["version"] += 1
             self.states.move_to_end(key)
             return list(state["records"]), inserted
 
+    def _visible_records(self, protocol, items, records):
+        limit = len(items) if protocol == "claude" else len(items) - 1
+        return [record for record in records if 0 <= record[0] <= limit and
+                self._anchor_matches(protocol, items, record[0], record[1])]
+
     def _with_records(self, body, protocol, records):
+        key = "messages" if protocol == "claude" else "input"
+        records = self._visible_records(protocol, body[key], records)
         if not records:
             return body
-        key = "messages" if protocol == "claude" else "input"
         result = copy.deepcopy(body)
         updates = {index: effort for index, _, effort in records}
         items = []
@@ -270,28 +298,36 @@ class Router:
                              if protocol == "claude" else
                              {"type": "configuration_update", "reasoning": {"effort": updates[index]}})
             items.append(item)
+        if protocol == "claude" and len(result[key]) in updates:
+            items.append({"role": "system", "content": [], "output_config":
+                          {"effort": updates[len(result[key])]}})
         result[key] = items
         return result
 
     def _finish(self, body, protocol, key, items, index, version, records, decided, effort,
-                log=None):
-        final_records, inserted = self._commit(key, items, index, version, records, decided, effort)
+                log=None, unchanged=False):
+        final_records, inserted = self._commit(key, protocol, items, index, version, records, decided, effort)
         result = self._with_records(body, protocol, final_records)
-        if inserted and log:
+        if log and (inserted or unchanged):
             note(log)
-        elif final_records:
-            note(f"harness={protocol} replayed={len(final_records)}")
+        else:
+            replayed = len(self._visible_records(protocol, items, final_records))
+            if replayed:
+                note(f"harness={protocol} replayed={replayed}")
         return result
 
     def rewrite(self, body, protocol="codex", threshold=None, capabilities=None, conversation_id=None):
         model = body.get("model", "")
         if protocol == "claude":
-            levels = list(LEVELS) if model in CLAUDE_MODELS else []
+            if model not in CLAUDE_MODELS:
+                note("unchanged: unsupported model")
+                return body
+            levels = list(LEVELS)
             if body.get("thinking", {}).get("type") == "disabled":
                 levels = [level for level in levels if level not in ("max", "xhigh")]
         else:
             if model not in CODEX_MODELS:
-                note("unchanged: model capabilities unavailable")
+                note("unchanged: unsupported model")
                 return body
             levels = (self.models if capabilities is None else capabilities).get(model, [])
         available = [level for level in LEVELS if level in levels]
@@ -306,9 +342,7 @@ class Router:
         if not available or "low" not in available:
             note("unchanged: model capabilities unavailable")
             return body
-        if any((protocol == "codex" and item.get("type") == "configuration_update") or
-                (protocol == "claude" and item.get("role") == "system" and item.get("content", []) == [] and
-                 "output_config" in item) for item in items):
+        if any(protocol == "codex" and item.get("type") == "configuration_update" for item in items):
             note("unchanged: per-message effort override in history")
             return body
         if protocol == "codex":
@@ -329,19 +363,15 @@ class Router:
             note("unchanged: conversation key unavailable")
             return body
         insertion = claude_boundary(items) if protocol == "claude" else codex_boundary(items)
-        try:
-            key = self._state_key(protocol, model, conversation_id, items)
-        except (TypeError, ValueError):
-            note("unchanged: unsupported input shape")
-            return body
-        version, records, decided = self._state_snapshot(key, items)
+        key = self._state_key(protocol, model, conversation_id, items)
+        version, records, decided = self._state_snapshot(key, protocol, items)
         if insertion is None:
             result = self._with_records(body, protocol, records)
             if records:
                 note(f"harness={protocol} replayed={len(records)}")
             return result
-        anchor = item_hash(items[insertion])
-        if (decided.get(insertion) == anchor or any(record[0] == insertion for record in records)):
+        anchor = self._record_anchor(protocol, items, insertion)
+        if (decided == (insertion, anchor) or any(record[0] == insertion for record in records)):
             result = self._with_records(body, protocol, records)
             if records:
                 note(f"harness={protocol} replayed={len(records)}")
@@ -351,17 +381,33 @@ class Router:
         state = claude_context(body) if protocol == "claude" else context_for(body)
         if not state:
             return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
-        previous = [record for record in records if record[0] < insertion]
         top = body.get("output_config" if protocol == "claude" else "reasoning")
-        effective = previous[-1][2] if previous else (top.get("effort") if isinstance(top, dict) else None)
+        effective = top.get("effort") if isinstance(top, dict) else None
+        if protocol == "claude":
+            proxy_efforts = {record[0]: record[2] for record in records}
+            for position, item in enumerate(items[:insertion]):
+                if position in proxy_efforts:
+                    effective = proxy_efforts[position]
+                output_config = item.get("output_config")
+                if isinstance(output_config, dict) and output_config.get("effort") is not None:
+                    effective = output_config["effort"]
+        else:
+            previous = [record for record in records if record[0] < insertion]
+            if previous:
+                effective = previous[-1][2]
+        replayed = sum(record[0] < insertion for record in records)
         start = time.monotonic()
         try:
+            busy = False
             with self.lock:
                 if self.pending is not None and not self.pending.done():
-                    note("unchanged: classifier busy")
-                    return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
-                self.pending = self.executor.submit(self.agent.predict, state, QUESTION)
-                future = self.pending
+                    busy = True
+                else:
+                    self.pending = self.executor.submit(self.agent.predict, state, QUESTION)
+                    future = self.pending
+            if busy:
+                note("unchanged: classifier busy")
+                return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
             answer = future.result(timeout=self.timeout)["answers"]["effort"]
             confidence = float(answer["probabilities"][answer["choice"]])
             if answer["choice"] not in LEVELS or not math.isfinite(confidence) or not 0 <= confidence <= 1:
@@ -371,10 +417,14 @@ class Router:
                 return self._finish(body, protocol, key, items, insertion, version, records, decided, None)
             effort = next((level for level in available
                            if LEVELS.index(level) >= LEVELS.index(answer["choice"])), available[-1])
+            if effort == effective:
+                result = self._finish(body, protocol, key, items, insertion, version, records, decided, None,
+                                      f"harness={protocol} effort={effort} unchanged replayed={replayed}", True)
+                return result
             return self._finish(body, protocol, key, items, insertion, version, records, decided,
-                                effort if effort != effective else None,
+                                effort,
                                 f"harness={protocol} effort={effort} inserted_at={insertion} "
-                                f"replayed={len(records)} probability={confidence:.2f} "
+                                f"replayed={replayed} probability={confidence:.2f} "
                                 f"classifier_ms={(time.monotonic()-start)*1000:.0f}")
         except Exception as exc:
             # Exception messages may contain input data, so log only their class.
